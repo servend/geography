@@ -1,4 +1,5 @@
-﻿using System;
+﻿
+using System;
 using System.Collections.Generic;
 using System.Net.Http;
 using System.Threading.Tasks;
@@ -11,6 +12,9 @@ using NetTopologySuite.Geometries;
 using NetTopologySuite.IO;
 using NetTopologySuite;
 using System.Text.RegularExpressions;
+using System.Linq;
+using Newtonsoft.Json.Linq;
+using NetTopologySuite.Geometries.Prepared;
 
 class City
 {
@@ -20,13 +24,14 @@ class City
     public double Longitude { get; set; }
     public double Distance { get; set; }
     public int Population { get; set; }
-    public Geometry Geometry => new Point(new Coordinate(Longitude, Latitude)) { SRID = 4326 };
+    public Geometry Geometry => new Point(Longitude, Latitude) { SRID = 4326 };
 }
 
 class Program
 {
     private static readonly HttpClient client = new HttpClient();
     private static Geometry russianBorder;
+    private static IPreparedGeometry preparedRussianBorder;
 
     static async Task Main(string[] args)
     {
@@ -40,14 +45,20 @@ class Program
             return;
         }
 
-        string inputPath = @"C:\Users\User\Desktop\grid.xlsx";
+        // Подготовка геометрии границы России
+        preparedRussianBorder = PreparedGeometryFactory.Prepare(russianBorder);
+
+        string inputPath = @"C:\Users\User\Desktop\grid.xlsx"; // Путь к основному файлу
         string outputPath = @"C:\Users\User\Desktop\nearby_cities.xlsx";
+        //string excludedCitiesPath = @"C:\Users\User\Desktop\excluded_cities.xlsx"; //Больше не нужен
 
         List<City> cities = ReadCitiesFromExcel(inputPath);
-        List<City> filteredCities = FilterCities(cities);
-        Console.WriteLine($"После фильтрации осталось городов: {filteredCities.Count}");
+        List<string> excludedCityNames = ReadExcludedCityNamesFromExcel(inputPath); // Используем тот же путь, что и для городов
 
-        List<List<City>> nearbyCities = await FindNearbyCitiesForAll(filteredCities, 100);
+        List<City> filteredCities = FilterCities(cities);
+        Console.WriteLine($"После фильтрации по границам осталось городов: {filteredCities.Count}");
+
+        List<List<City>> nearbyCities = await FindNearbyCitiesForAll(filteredCities, 100, excludedCityNames);
         WriteNearbyCitiesToExcel(filteredCities, nearbyCities, outputPath);
 
         Console.WriteLine("Обработка завершена. Результаты сохранены в " + outputPath);
@@ -60,57 +71,152 @@ class Program
 
         List<City> cities = new List<City>();
 
-        using (var package = new ExcelPackage(new FileInfo(filePath)))
+        try
         {
-            var worksheet = package.Workbook.Worksheets[0];
-            int rowCount = worksheet.Dimension.Rows;
-
-            for (int row = 2; row <= rowCount; row++)
+            using (var package = new ExcelPackage(new FileInfo(filePath)))
             {
-                cities.Add(new City
+                var worksheet = package.Workbook.Worksheets[0]; // Первый лист для основных городов
+                int rowCount = worksheet.Dimension.Rows;
+
+                for (int row = 2; row <= rowCount; row++)
                 {
-                    Longitude = ParseDouble(worksheet.Cells[row, 1].Text, ci),
-                    Latitude = ParseDouble(worksheet.Cells[row, 2].Text, ci),
-                    Name = worksheet.Cells[row, 3].Text,
-                    Population = ParseInt(worksheet.Cells[row, 4].Text)
-                });
+                    try
+                    {
+                        cities.Add(new City
+                        {
+                            Longitude = ParseDouble(worksheet.Cells[row, 1].Text, ci),
+                            Latitude = ParseDouble(worksheet.Cells[row, 2].Text, ci),
+                            Name = worksheet.Cells[row, 3].Text,
+                            Population = ParseInt(worksheet.Cells[row, 4].Text)
+                        });
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"Ошибка при чтении строки {row}: {ex.Message}");
+                    }
+                }
             }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка при чтении файла Excel: {ex.Message}");
         }
 
         return cities;
     }
 
+
+    static List<string> ReadExcludedCityNamesFromExcel(string filePath)
+    {
+        List<string> excludedCities = new List<string>();
+
+        try
+        {
+            using (var package = new ExcelPackage(new FileInfo(filePath)))
+            {
+                var worksheet = package.Workbook.Worksheets[1]; // Второй лист для исключенных городов
+                int rowCount = worksheet.Dimension.Rows;
+
+                for (int row = 1; row <= rowCount; row++)
+                {
+                    string cityName = worksheet.Cells[row, 1].Text?.Trim();
+                    if (!string.IsNullOrEmpty(cityName))
+                    {
+                        excludedCities.Add(cityName);
+                    }
+                }
+            }
+            Console.WriteLine($"Прочитано {excludedCities.Count} исключенных городов.");
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Ошибка чтения файла исключенных городов: {ex.Message}");
+        }
+
+        return excludedCities;
+    }
+
+    static double NormalizeLongitude(double lon)
+    {
+        while (lon > 180) lon -= 360;
+        while (lon < -180) lon += 360;
+        return lon;
+    }
+
     static List<City> FilterCities(List<City> cities)
     {
         var filtered = new List<City>();
+        var geometryFactory = NtsGeometryServices.Instance.CreateGeometryFactory(4326);
+
         foreach (var city in cities)
         {
-            if (russianBorder.Contains(city.Geometry))
+            try
             {
-                filtered.Add(city);
+                // Нормализация долготы
+                double normalizedLongitude = NormalizeLongitude(city.Longitude);
+
+                // Создаем геометрию города с нормализованной долготой
+                Geometry cityGeometry = new Point(normalizedLongitude, city.Latitude) { SRID = 4326 };
+
+                // Буферизация города (минимальный буфер для начала)
+                double bufferSize = 0.0001;
+                Geometry bufferedCity = cityGeometry.Buffer(bufferSize);
+                bufferedCity.SRID = 4326;
+
+                // Проверка пересечения с использованием PreparedGeometry
+                bool intersects = preparedRussianBorder.Intersects(bufferedCity);
+
+                // **Обходной путь для потенциального разрыва границы:**
+                if (!intersects && Math.Abs(normalizedLongitude) > 170) // Если долгота близка к 180 меридиану
+                {
+                    // Создаем альтернативную геометрию, смещенную на 0.0001 градуса (примерно 10 метров)
+                    Geometry alternativeCityGeometry = new Point(normalizedLongitude + 0.0001, city.Latitude) { SRID = 4326 };
+                    Geometry alternativeBufferedCity = alternativeCityGeometry.Buffer(bufferSize);
+                    alternativeBufferedCity.SRID = 4326;
+                    intersects = preparedRussianBorder.Intersects(alternativeBufferedCity);
+
+                    if (!intersects) //проверяем в другую сторону
+                    {
+                        alternativeCityGeometry = new Point(normalizedLongitude - 0.0001, city.Latitude) { SRID = 4326 };
+                        alternativeBufferedCity = alternativeCityGeometry.Buffer(bufferSize);
+                        alternativeBufferedCity.SRID = 4326;
+                        intersects = preparedRussianBorder.Intersects(alternativeBufferedCity);
+                    }
+                }
+
+                if (intersects)
+                {
+                    filtered.Add(city);
+                    Console.WriteLine($"Город {city.Name} ({city.Longitude}, {city.Latitude}) добавлен.");
+                }
+                else
+                {
+                    Console.WriteLine($"Город {city.Name} ({city.Longitude}, {city.Latitude}) исключен.");
+                }
             }
-            else
+            catch (Exception ex)
             {
-                Console.WriteLine($"Город {city.Name} не находится в пределах границ России и будет исключен.");
+                Console.WriteLine($"Ошибка при обработке города {city.Name}: {ex.Message}");
             }
         }
+
         return filtered;
     }
 
-    static async Task<List<List<City>>> FindNearbyCitiesForAll(List<City> cities, int radiusKm)
+    static async Task<List<List<City>>> FindNearbyCitiesForAll(List<City> cities, int radiusKm, List<string> excludedCityNames)
     {
         List<List<City>> allNearbyCities = new List<List<City>>();
         foreach (var city in cities)
         {
             Console.WriteLine($"\nОбработка города: {city.Name}");
-            var nearby = await FindCitiesInRadius(city.Latitude, city.Longitude, radiusKm);
+            var nearby = await FindCitiesInRadius(city.Latitude, city.Longitude, radiusKm, excludedCityNames, city); // Передаем исходный город!
             allNearbyCities.Add(nearby);
             await Task.Delay(1000);
         }
         return allNearbyCities;
     }
 
-    static async Task<List<City>> FindCitiesInRadius(double lat, double lon, int radiusKm)
+    static async Task<List<City>> FindCitiesInRadius(double lat, double lon, int radiusKm, List<string> excludedCityNames, City originalCity)
     {
         string overpassQuery = $@"
 <osm-script>
@@ -127,6 +233,8 @@ class Program
         {
             using var content = new StringContent(overpassQuery, Encoding.UTF8, "application/xml");
             var response = await client.PostAsync("https://overpass-api.de/api/interpreter", content);
+            response.EnsureSuccessStatusCode();
+
             var responseContent = await response.Content.ReadAsStringAsync();
 
             var cities = new List<City>();
@@ -140,13 +248,25 @@ class Program
                     double elementLat = double.Parse(node.Attributes["lat"].Value, CultureInfo.InvariantCulture);
                     double elementLon = double.Parse(node.Attributes["lon"].Value, CultureInfo.InvariantCulture);
 
-                    var point = new Point(new Coordinate(elementLon, elementLat)) { SRID = 4326 };
+                    var point = new Point(elementLon, elementLat) { SRID = 4326 };
                     if (!russianBorder.Contains(point)) continue;
 
                     string cityName = node.SelectSingleNode("tag[@k='name']")?.Attributes["v"]?.Value ?? "Unknown";
 
-                    // Проверка на русское название города
                     if (!IsRussianName(cityName)) continue;
+
+                    if (excludedCityNames.Contains(cityName))
+                    {
+                        Console.WriteLine($"Город {cityName} исключен из результатов.");
+                        continue;
+                    }
+
+                    // Проверка на то, что это не тот же самый город
+                    if (cityName == originalCity.Name)
+                    {
+                        Console.WriteLine($"Город {cityName} пропущен, так как это исходный город.");
+                        continue;
+                    }
 
                     var city = new City
                     {
@@ -176,6 +296,11 @@ class Program
             Console.WriteLine($"Всего найдено городов: {cities.Count}");
             return cities;
         }
+        catch (HttpRequestException e)
+        {
+            Console.WriteLine($"Ошибка HTTP запроса: {e.Message}");
+            return new List<City>();
+        }
         catch (Exception e)
         {
             Console.WriteLine($"Ошибка запроса: {e.Message}");
@@ -185,23 +310,46 @@ class Program
 
     static async Task<Geometry> GetRussianBorder()
     {
+        Console.WriteLine("Получение границы России...");
+
         string geoJsonUrl = "https://raw.githubusercontent.com/johan/world.geo.json/master/countries/RUS.geo.json";
 
         try
         {
-            var response = await client.GetStringAsync(geoJsonUrl);
-            var reader = new GeoJsonReader();
-            var featureCollection = reader.Read<NetTopologySuite.Features.FeatureCollection>(response);
+            using (var client = new HttpClient())
+            {
+                var response = await client.GetStringAsync(geoJsonUrl);
+                Console.WriteLine("GeoJSON получен успешно.");
 
-            var geometry = featureCollection[0].Geometry;
-            geometry.SRID = 4326;
+                if (string.IsNullOrEmpty(response))
+                {
+                    throw new Exception("Получен пустой ответ от сервера.");
+                }
 
-            Console.WriteLine($"Границы России успешно загружены. Тип: {geometry.GeometryType}");
-            return geometry;
+                var reader = new GeoJsonReader();
+                var featureCollection = reader.Read<NetTopologySuite.Features.FeatureCollection>(response);
+
+                if (featureCollection == null || featureCollection.Count == 0)
+                {
+                    throw new Exception("Не удалось прочитать FeatureCollection из GeoJSON.");
+                }
+
+                var feature = featureCollection[0];
+                var geometry = feature.Geometry;
+
+                if (geometry == null)
+                {
+                    throw new Exception("Геометрия в Feature отсутствует.");
+                }
+
+                Console.WriteLine($"Граница России получена успешно. Тип геометрии: {geometry.GeometryType}");
+                return geometry;
+            }
         }
-        catch (Exception ex)
+        catch (Exception e)
         {
-            Console.WriteLine($"Ошибка загрузки границ: {ex.Message}");
+            Console.WriteLine($"Ошибка при получении границы России: {e.Message}");
+            Console.WriteLine($"Stack Trace: {e.StackTrace}");
             return null;
         }
     }
@@ -264,16 +412,20 @@ class Program
         return 6376500.0 * (2.0 * Math.Atan2(Math.Sqrt(d3), Math.Sqrt(1.0 - d3))) / 1000;
     }
 
-    static double ParseDouble(string value, CultureInfo ci) =>
-        double.TryParse(value, NumberStyles.Any, ci, out double result) ? result : 0;
+    static double ParseDouble(string value, CultureInfo ci)
+    {
+        if (string.IsNullOrEmpty(value)) return 0;
+        return double.TryParse(value, NumberStyles.Any, ci, out double result) ? result : 0;
+    }
 
-    static int ParseInt(string value) =>
-        int.TryParse(value, out int result) ? result : 0;
+    static int ParseInt(string value)
+    {
+        if (string.IsNullOrEmpty(value)) return 0;
+        return int.TryParse(value, out int result) ? result : 0;
+    }
 
-    // Проверка на русское название города
     static bool IsRussianName(string name)
     {
-        // Регулярное выражение для проверки кириллических символов, пробелов и дефисов
         return Regex.IsMatch(name, @"^[А-Яа-я\s-]+$");
     }
 }
